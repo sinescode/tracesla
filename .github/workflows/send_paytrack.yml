@@ -1,0 +1,45 @@
+name: PayTrack Send All
+
+on:
+  # ── Run on every push to any branch ───────────────────────────────────────
+  push:
+
+  # ── Also keep manual trigger from GitHub Actions UI ───────────────────────
+  workflow_dispatch:
+
+jobs:
+  send-all:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Check out the repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Set up Python
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # 3. Install system fonts (for Pillow card rendering)
+      - name: Install system fonts
+        run: |
+          sudo apt-get update -qq
+          
+
+      # 4. Install Python dependencies
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pillow aiohttp python-dotenv
+
+      # 5. Create .env from GitHub Secrets
+      - name: Create .env file
+        run: |
+          echo "TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}" >> .env
+
+      # 6. Run the sender
+      - name: Run send_all.py
+        run: python send_all.py
