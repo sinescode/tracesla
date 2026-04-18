@@ -12,6 +12,9 @@ Usage:
 Requires:
     pip install pillow aiohttp python-dotenv
     TELEGRAM_BOT_TOKEN in .env or environment
+    Fonts in repo: Fonts/LobsterTwo-Regular.ttf
+                   Fonts/LobsterTwo-Bold.ttf
+                   Fonts/Monoton-Regular.ttf
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import glob
+import io
 import json
 import logging
 import os
@@ -26,10 +30,10 @@ import random
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
-from typing import Sequence
+from typing import Optional, Sequence, Tuple
 
 from dotenv import load_dotenv
+from PIL import Image, ImageDraw, ImageFont
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -69,7 +73,6 @@ def get_tier_definitions(cfg_data: dict) -> list[dict]:
 
 
 def get_user_tiers(cfg_data: dict) -> dict[str, list[int]]:
-    """Returns {user_id: [tier_id, ...]}"""
     return {k: v for k, v in cfg_data["config"]["user_tiers"].items()}
 
 
@@ -82,7 +85,6 @@ def get_balances(cfg_data: dict) -> dict[str, float]:
 
 
 def build_tier_index(tier_defs: list[dict]) -> dict[int, dict]:
-    """Returns {tier_id: tier_dict}"""
     return {t["id"]: t for t in tier_defs}
 
 
@@ -93,7 +95,6 @@ def build_tier_index(tier_defs: list[dict]) -> dict[int, dict]:
 def get_tiers_for_user(user_id: str,
                         user_tier_map: dict[str, list[int]],
                         tier_index: dict[int, dict]) -> list[dict]:
-    """Return ordered tier list for a user, or empty list if not configured."""
     ids = user_tier_map.get(user_id, [])
     return sorted(
         [tier_index[i] for i in ids if i in tier_index],
@@ -102,7 +103,6 @@ def get_tiers_for_user(user_id: str,
 
 
 def calculate_total(ok_count: int, tiers: list[dict]) -> tuple[float, float]:
-    """Returns (price_per_ok, total)  — 0,0 if no tier matches."""
     for tier in tiers:
         if tier["min_ok"] <= ok_count <= tier["max_ok"]:
             return tier["price_per_ok"], ok_count * tier["price_per_ok"]
@@ -114,12 +114,6 @@ def calculate_total(ok_count: int, tiers: list[dict]) -> tuple[float, float]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_csv_entries(csv_dir: str = "CSV") -> list[dict]:
-    """
-    Read every *.csv in csv_dir.
-    Returns a list of row-dicts with keys:
-        filename, user_id, username, ok_count,
-        rate_str, bkash, rocket, paid_status
-    """
     entries: list[dict] = []
     pattern = os.path.join(csv_dir, "*.csv")
     files = sorted(glob.glob(pattern))
@@ -159,40 +153,30 @@ def load_csv_entries(csv_dir: str = "CSV") -> list[dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. BUILD USER SUMMARIES (net pending per user)
+# 4. BUILD USER SUMMARIES
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_user_summaries(cfg_data: dict, csv_dir: str = "CSV") -> list[dict]:
-    """
-    Returns a list of:
-        {user_id, display_name, pending}
-    sorted by pending descending (largest debt first).
-    """
-    tier_defs    = get_tier_definitions(cfg_data)
-    tier_index   = build_tier_index(tier_defs)
+    tier_defs     = get_tier_definitions(cfg_data)
+    tier_index    = build_tier_index(tier_defs)
     user_tier_map = get_user_tiers(cfg_data)
     custom_names  = get_custom_names(cfg_data)
     balances      = get_balances(cfg_data)
+    entries       = load_csv_entries(csv_dir)
 
-    entries = load_csv_entries(csv_dir)
-
-    # Accumulate totals per user
     user_totals: dict[str, float] = {}
     for entry in entries:
         uid      = entry["user_id"]
         ok_count = entry["ok_count"]
         paid     = entry["paid_status"]
 
-        # Skip already-paid rows
         if paid in ("paid", "p"):
             continue
 
-        # Determine price: user tiers first, then CSV rate, then 0
         user_tiers = get_tiers_for_user(uid, user_tier_map, tier_index)
         if user_tiers:
             _, total = calculate_total(ok_count, user_tiers)
         else:
-            # Fallback: use Rate column from CSV
             try:
                 rate = float(entry["rate_str"])
                 total = ok_count * rate
@@ -201,7 +185,6 @@ def build_user_summaries(cfg_data: dict, csv_dir: str = "CSV") -> list[dict]:
 
         user_totals[uid] = user_totals.get(uid, 0.0) + total
 
-    # Merge with balance adjustments
     all_uids = set(user_totals) | {k for k, v in balances.items() if v != 0}
     summaries: list[dict] = []
     for uid in all_uids:
@@ -219,237 +202,376 @@ def build_user_summaries(cfg_data: dict, csv_dir: str = "CSV") -> list[dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. CARD GENERATOR  (inline Pillow — no separate file needed)
+# 5. CARD GENERATOR  — exact original, Lobster Two fonts only
 # ─────────────────────────────────────────────────────────────────────────────
 
-import io as _io
-try:
-    from PIL import Image, ImageDraw, ImageFont
-    _PIL_AVAILABLE = True
-except ImportError:
-    _PIL_AVAILABLE = False
-    log.warning("Pillow not installed — card generation will produce blank PNGs")
+_HERE = os.path.dirname(os.path.abspath(__file__))
 
+def _find_font(bold: bool = False, mono: bool = False) -> Optional[str]:
+    """
+    Resolve font path — Lobster Two family first, then FreeFonts as fallback.
+    Mono flag still falls back to FreeMono since Lobster Two has no mono variant.
+    """
+    fonts_dir = os.path.join(_HERE, "Fonts")
+    free_dir  = "/usr/share/fonts/truetype/freefont/"
 
-def _find_font(bold: bool = False, mono: bool = False):
-    free_dir = "/usr/share/fonts/truetype/freefont/"
-    local_dir = os.path.dirname(os.path.abspath(__file__))
-    candidates = []
-    if bold and not mono:
-        candidates += [
-            os.path.join(local_dir, "LobsterTwo-Bold.ttf"),
+    if mono and bold:
+        candidates = [
+            os.path.join(fonts_dir, "LobsterTwo-Regular.ttf"),
+            os.path.join(free_dir,  "FreeMonoBold.ttf"),
+        ]
+    elif mono:
+        candidates = [
+            os.path.join(fonts_dir, "LobsterTwo-Regular.ttf"),
+            os.path.join(free_dir,  "FreeMono.ttf"),
+        ]
+    elif bold:
+        candidates = [
+            os.path.join(fonts_dir, "LobsterTwo-Regular.ttf"),
+            os.path.join(fonts_dir, "LobsterTwo-Regular.ttf"),
             os.path.join(free_dir,  "FreeSansBold.ttf"),
         ]
-    elif mono and bold:
-        candidates += [os.path.join(free_dir, "FreeMonoBold.ttf")]
-    elif mono:
-        candidates += [os.path.join(free_dir, "FreeMono.ttf")]
     else:
-        candidates += [
-            os.path.join(local_dir, "LobsterTwo-Regular.ttf"),
+        candidates = [
+            os.path.join(fonts_dir, "LobsterTwo-Regular.ttf"),
             os.path.join(free_dir,  "FreeSans.ttf"),
         ]
-    for p in candidates:
-        if os.path.isfile(p):
-            return p
+
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
     return None
 
 
-def _font(bold=False, size=14, mono=False):
+def _font(bold: bool = False, size: int = 14, mono: bool = False) -> ImageFont.FreeTypeFont:
     path = _find_font(bold, mono)
     if path:
         return ImageFont.truetype(path, size)
     return ImageFont.load_default()
 
 
+# ── CardConfig ────────────────────────────────────────────────────────────────
+
+@dataclass
+class CardConfig:
+    width: int = 960
+    height: int = 540
+
+    padding_h: float = 0.06
+    padding_v: float = 0.06
+    avatar_size: float = 0.13
+    divider_y: float = 0.38
+    right_panel_width: float = 0.28
+
+    bg_dark: Tuple[int, int, int] = (15, 23, 42)
+    bg_card: Tuple[int, int, int] = (30, 41, 59)
+    accent_credit: Tuple[int, int, int] = (16, 185, 129)
+    accent_debit: Tuple[int, int, int] = (239, 68, 68)
+    surface_light: Tuple[int, int, int] = (51, 65, 85)
+    surface_dark: Tuple[int, int, int] = (30, 41, 59)
+    text_primary: Tuple[int, int, int] = (248, 250, 252)
+    text_muted: Tuple[int, int, int] = (148, 163, 184)
+    divider_color: Tuple[int, int, int] = (71, 85, 105)
+
+    font_initial: float = 0.08
+    font_name: float = 0.055
+    font_id: float = 0.028
+    font_logo: float = 0.03
+    font_balance_label: float = 0.024
+    font_balance_symbol: float = 0.065
+    font_balance_amount: float = 0.12
+    font_status: float = 0.028
+    font_date: float = 0.026
+    font_stat_label: float = 0.022
+    font_stat_value: float = 0.032
+
+
+def _alpha_blend(color, alpha: float, bg):
+    return tuple(int(c * alpha + b * (1 - alpha)) for c, b in zip(color, bg))
+
+
 def _lerp(a, b, t):
     return int(a * (1 - t) + b * t)
 
 
-def _blend(color, alpha, bg):
-    return tuple(int(c * alpha + b * (1 - alpha)) for c, b in zip(color, bg))
+# ── generate_card ─────────────────────────────────────────────────────────────
 
+def generate_card(user_id: str, display_name: str, pending: float, date: str,
+                  config: Optional[CardConfig] = None) -> bytes:
+    if config is None:
+        config = CardConfig()
 
-def generate_card(user_id: str, display_name: str,
-                  pending: float, date: str) -> bytes:
-    """Generate a payment card PNG and return its bytes."""
-    if not _PIL_AVAILABLE:
-        # Return a 1×1 transparent PNG as fallback
-        buf = _io.BytesIO()
-        Image.new("RGB", (1, 1)).save(buf, "PNG")
-        return buf.getvalue()
-
-    W, H = 960, 540
+    W, H = config.width, config.height
     is_credit = pending < 0
-    abs_pend  = abs(pending)
-    abs_str   = f"{abs_pend:,.2f}"
-    initial   = (display_name[0] if display_name else user_id[0]).upper()
+    abs_pend = abs(pending)
+    abs_str = f"{abs_pend:,.2f}"
+    initial = (display_name[0] if display_name else user_id[0]).upper()
+    accent = config.accent_credit if is_credit else config.accent_debit
+    status_lbl = "CREDIT" if is_credit else "DEBIT"
+    bal_label = "CREDIT BALANCE" if is_credit else "PENDING BALANCE"
 
-    # Colours
-    BG_DARK  = (15,  23,  42)
-    BG_CARD  = (30,  41,  59)
-    SLATE600 = (71,  85, 105)
-    SLATE700 = (51,  65,  85)
-    SLATE400 = (148, 163, 184)
-    SLATE50  = (248, 250, 252)
-    EMERALD  = (16,  185, 129)
-    RED      = (239,  68,  68)
-    accent   = EMERALD if is_credit else RED
-    status   = "CREDIT" if is_credit else "DEBIT"
-    bal_lbl  = "CREDIT BALANCE" if is_credit else "PENDING BALANCE"
+    pad_x = int(W * config.padding_h)
+    pad_y = int(H * config.padding_v)
+    avatar_size = int(W * config.avatar_size)
+    avatar_radius = avatar_size // 5
+    name_x = pad_x + avatar_size + int(pad_x * 1.0)
+    divider_y = int(H * config.divider_y)
+    right_panel_x = W - int(W * config.right_panel_width) - pad_x
+    right_panel_w = int(W * config.right_panel_width)
 
-    pad_x       = int(W * 0.06)
-    pad_y       = int(H * 0.06)
-    av_size     = int(W * 0.13)
-    av_radius   = av_size // 5
-    divider_y   = int(H * 0.38)
-    rpanel_w    = int(W * 0.28)
-    rpanel_x    = W - rpanel_w - pad_x
+    def fs(factor: float) -> int:
+        return int(H * factor)
 
-    def fs(factor): return int(H * factor)
-
-    img  = Image.new("RGB", (W, H), BG_CARD)
+    img = Image.new("RGB", (W, H), config.bg_card)
     draw = ImageDraw.Draw(img)
 
-    # Gradient background
+    # 1. Gradient Background
     for y in range(H):
         t = y / H
-        ts = t * t * (3 - 2 * t)
-        r = _lerp(BG_DARK[0], BG_CARD[0], ts)
-        g = _lerp(BG_DARK[1], BG_CARD[1], ts)
-        b = _lerp(BG_DARK[2], BG_CARD[2], ts)
+        t_smooth = t * t * (3 - 2 * t)
+        r = _lerp(config.bg_dark[0], config.bg_card[0], t_smooth)
+        g = _lerp(config.bg_dark[1], config.bg_card[1], t_smooth)
+        b = _lerp(config.bg_dark[2], config.bg_card[2], t_smooth)
         draw.line([(0, y), (W, y)], fill=(r, g, b))
 
-    # Glow orb
+    # 2. Glow Orb
     orb = Image.new("RGB", (W, H), (0, 0, 0))
-    od  = ImageDraw.Draw(orb)
+    od = ImageDraw.Draw(orb)
     cx, cy, rad = int(W * 0.15), int(H * 0.22), int(W * 0.20)
-    for rr in range(rad, 0, -3):
-        a = 0.12 * (1 - rr / rad) ** 2
-        od.ellipse([cx - rr, cy - rr, cx + rr, cy + rr],
-                   fill=_blend(accent, a, (0, 0, 0)))
-    img  = Image.blend(img, orb, alpha=0.6)
+    for r in range(rad, 0, -3):
+        alpha_val = 0.12 * (1 - r / rad) ** 2
+        col = _alpha_blend(accent, alpha_val, (0, 0, 0))
+        od.ellipse([cx - r, cy - r, cx + r, cy + r], fill=col)
+    img = Image.blend(img, orb, alpha=0.6)
     draw = ImageDraw.Draw(img)
 
-    # Top accent stripe
-    for x in range(int(W * 0.60)):
-        a = (1.0 - x / (W * 0.60)) * 0.8
-        draw.line([(x, 0), (x, 3)], fill=_blend(accent, a, BG_CARD))
+    # 3. Grid Pattern
+    grid_color = _alpha_blend(config.divider_color, 0.15, config.bg_card)
+    grid_spacing_x = int(W * 0.06)
+    grid_spacing_y = int(H * 0.12)
+    for gx in range(pad_x, W, grid_spacing_x):
+        draw.line([(gx, 0), (gx, H)], fill=grid_color, width=1)
+    for gy in range(pad_y, H, grid_spacing_y):
+        draw.line([(0, gy), (W, gy)], fill=grid_color, width=1)
 
-    # Avatar
-    av_x, av_y = pad_x, int(pad_y * 1.2)
+    # 4. Card Border
+    border_alpha = 0.18
     draw.rounded_rectangle(
-        [av_x, av_y, av_x + av_size, av_y + av_size],
-        radius=av_radius,
-        fill=_blend(accent, 0.55, BG_CARD)
-    )
-    f_init = _font(bold=True, size=fs(0.08))
-    bb = draw.textbbox((0, 0), initial, font=f_init)
-    draw.text(
-        (av_x + (av_size - (bb[2] - bb[0])) // 2,
-         av_y + (av_size - (bb[3] - bb[1])) // 2),
-        initial, font=f_init, fill=SLATE50
+        [pad_x//2, pad_y//2, W - pad_x//2, H - pad_y//2],
+        radius=28,
+        outline=_alpha_blend(accent, border_alpha, config.bg_card),
+        width=1
     )
 
-    # Name & ID
-    name_x = av_x + av_size + pad_x
-    name_y = int(pad_y * 1.2)
-    f_name = _font(bold=True, size=fs(0.055))
-    draw.text((name_x, name_y), display_name, font=f_name, fill=SLATE50)
-    f_id = _font(size=fs(0.028))
-    draw.text((name_x, name_y + int(H * 0.07)), f"ID: {user_id}", font=f_id, fill=SLATE400)
+    # 5. Top Accent Stripe
+    stripe_height = 3
+    for x in range(int(W * 0.60)):
+        t = x / (W * 0.60)
+        alpha_stripe = 1.0 - t * 0.7
+        col = _alpha_blend(accent, alpha_stripe * 0.8, config.bg_card)
+        draw.line([(x, 0), (x, stripe_height)], fill=col)
 
-    # Logo
-    f_logo = _font(bold=True, size=fs(0.03))
-    draw.text((rpanel_x - pad_x, int(pad_y * 1.2)), "PayTrack", font=f_logo,
-              fill=_blend(accent, 0.85, BG_CARD))
+    # 6. Avatar
+    av_x, av_y = pad_x, int(pad_y * 1.2)
+    for g in range(8, 0, -1):
+        glow_alpha = 0.12 * (1 - g / 8)
+        draw.rounded_rectangle(
+            [av_x - 3 - g, av_y - 3 - g,
+             av_x + avatar_size + 3 + g, av_y + avatar_size + 3 + g],
+            radius=avatar_radius + 3 + g,
+            outline=_alpha_blend(accent, glow_alpha, config.bg_card),
+            width=1
+        )
+    draw.rounded_rectangle(
+        [av_x, av_y, av_x + avatar_size, av_y + avatar_size],
+        radius=avatar_radius,
+        fill=_alpha_blend(accent, 0.55, config.bg_card)
+    )
+    draw.rounded_rectangle(
+        [av_x, av_y, av_x + avatar_size, av_y + avatar_size],
+        radius=avatar_radius,
+        outline=_alpha_blend(accent, 0.3, config.bg_card),
+        width=1
+    )
+    f_init = _font(bold=True, size=fs(config.font_initial))
+    bbox = draw.textbbox((0, 0), initial, font=f_init)
+    text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    text_x = av_x + avatar_size // 2 - text_w // 2
+    text_y = av_y + avatar_size // 2 - text_h // 2 - 2
+    draw.text((text_x, text_y), initial, font=f_init, fill=config.text_primary)
 
-    # Divider
-    draw.line([(pad_x, divider_y), (rpanel_x - pad_x, divider_y)],
-              fill=SLATE600, width=1)
+    # 7. Name and ID
+    f_name = _font(bold=True, size=fs(config.font_name))
+    name_y = av_y + int(H * 0.01)
+    draw.text((name_x, name_y), display_name, font=f_name, fill=config.text_primary)
+    f_id = _font(size=fs(config.font_id))
+    id_y = name_y + fs(config.font_name) + int(H * 0.015)
+    draw.text((name_x, id_y), user_id.upper(), font=f_id, fill=config.text_muted)
 
-    # Balance section
-    bal_y = divider_y + int(H * 0.055)
-    f_lbl = _font(bold=True, size=fs(0.024))
-    draw.text((pad_x, bal_y), bal_lbl, font=f_lbl, fill=SLATE400)
-    amt_y = bal_y + int(H * 0.045)
-    f_sym = _font(size=fs(0.065))
-    f_amt = _font(bold=True, size=fs(0.12), mono=True)
-    sym_bb = draw.textbbox((0, 0), "৳", font=f_sym)
-    sym_w  = sym_bb[2] - sym_bb[0]; sym_h = sym_bb[3] - sym_bb[1]
-    amt_bb = draw.textbbox((0, 0), abs_str, font=f_amt)
-    amt_h  = amt_bb[3] - amt_bb[1]
-    base_y = amt_y + max(sym_h, amt_h)
-    draw.text((pad_x, base_y - sym_h), "৳",
-              font=f_sym, fill=_blend(accent, 0.75, BG_CARD))
-    draw.text((pad_x + sym_w + int(W * 0.02), base_y - amt_h), abs_str,
-              font=f_amt, fill=accent)
+    # 8. Logo
+    f_logo = _font(bold=True, size=fs(config.font_logo))
+    logo_text = "PAYTRACK"
+    bbox = draw.textbbox((0, 0), logo_text, font=f_logo)
+    logo_w = bbox[2] - bbox[0]
+    logo_y = av_y + int(H * 0.04)
+    draw.text((W - pad_x - logo_w, logo_y), logo_text, font=f_logo,
+              fill=_alpha_blend(accent, 0.65, config.bg_card))
 
-    # Status pill
+    # 9. Divider Line
+    for x in range(pad_x, W - pad_x):
+        t = (x - pad_x) / (W - 2 * pad_x)
+        div_alpha = 0.4 + 0.3 * (1 - abs(t - 0.5) * 2)
+        div_col = _alpha_blend(config.divider_color, div_alpha, config.bg_card)
+        draw.point((x, divider_y), fill=div_col)
+
+    # 10. Balance Section
+    bal_label_y = divider_y + int(H * 0.055)
+    f_label = _font(bold=True, size=fs(config.font_balance_label))
+    draw.text((pad_x, bal_label_y), bal_label, font=f_label, fill=config.text_muted)
+
+    bal_amt_y = bal_label_y + int(H * 0.045)
+    f_symbol = _font(size=fs(config.font_balance_symbol))
+    symbol_bbox = draw.textbbox((0, 0), "৳", font=f_symbol)
+    symbol_h = symbol_bbox[3] - symbol_bbox[1]
+    symbol_w = symbol_bbox[2] - symbol_bbox[0]
+    f_amount = _font(bold=True, size=fs(config.font_balance_amount), mono=True)
+    amount_bbox = draw.textbbox((0, 0), abs_str, font=f_amount)
+    amount_h = amount_bbox[3] - amount_bbox[1]
+    baseline_y = bal_amt_y + max(symbol_h, amount_h)
+    sym_x = pad_x
+    draw.text((sym_x, baseline_y - symbol_h), "৳",
+              font=f_symbol, fill=_alpha_blend(accent, 0.75, config.bg_card))
+    amt_x = sym_x + symbol_w + int(W * 0.02)
+    draw.text((amt_x, baseline_y - amount_h), abs_str, font=f_amount, fill=accent)
+
+    # 11. Status Pill
     pill_h = int(H * 0.07)
     pill_y = H - pad_y - pill_h - int(H * 0.015)
-    f_stat = _font(bold=True, size=fs(0.028))
-    stbb   = draw.textbbox((0, 0), status, font=f_stat)
-    st_w   = stbb[2] - stbb[0]
-    pp = 16; dot_d = 8; sp = 10
-    pill_w = pp + dot_d + sp + st_w + pp
-    draw.rounded_rectangle([pad_x, pill_y, pad_x + pill_w, pill_y + pill_h],
-                           radius=pill_h // 2,
-                           fill=_blend(accent, 0.10, BG_CARD))
-    draw.rounded_rectangle([pad_x, pill_y, pad_x + pill_w, pill_y + pill_h],
-                           radius=pill_h // 2,
-                           outline=_blend(accent, 0.20, BG_CARD), width=1)
-    dcx = pad_x + pp + dot_d // 2
-    dcy = pill_y + pill_h // 2
-    dr  = dot_d // 2
-    draw.ellipse([dcx - dr, dcy - dr, dcx + dr, dcy + dr], fill=accent)
-    draw.text((dcx + dr + sp,
-               pill_y + (pill_h - (stbb[3] - stbb[1])) // 2),
-              status, font=f_stat, fill=accent)
-
-    # Date
-    f_date = _font(size=fs(0.026))
-    dbb    = draw.textbbox((0, 0), date, font=f_date)
-    draw.text((W - pad_x - (dbb[2] - dbb[0]),
-               pill_y + (pill_h - (dbb[3] - dbb[1])) // 2),
-              date, font=f_date, fill=SLATE400)
-
-    # Right summary panel
+    f_status = _font(bold=True, size=fs(config.font_status))
+    status_bbox = draw.textbbox((0, 0), status_lbl, font=f_status)
+    status_w = status_bbox[2] - status_bbox[0]
+    pill_inner_pad = 16
+    dot_diameter = 8
+    spacing = 10
+    pill_w = pill_inner_pad + dot_diameter + spacing + status_w + pill_inner_pad
     draw.rounded_rectangle(
-        [rpanel_x, pad_y, rpanel_x + rpanel_w, H - pad_y],
-        radius=24, fill=SLATE700
+        [pad_x, pill_y, pad_x + pill_w, pill_y + pill_h],
+        radius=pill_h // 2,
+        fill=_alpha_blend(accent, 0.10, config.bg_card)
     )
-    f_ph = _font(bold=True, size=fs(0.028))
-    draw.text((rpanel_x + int(rpanel_w * 0.1), pad_y + int((H - 2 * pad_y) * 0.06)),
-              "SUMMARY", font=f_ph, fill=_blend(SLATE50, 0.7, SLATE700))
+    draw.rounded_rectangle(
+        [pad_x, pill_y, pad_x + pill_w, pill_y + pill_h],
+        radius=pill_h // 2,
+        outline=_alpha_blend(accent, 0.20, config.bg_card),
+        width=1
+    )
+    dot_cx = pad_x + pill_inner_pad + dot_diameter // 2
+    dot_cy = pill_y + pill_h // 2
+    dot_r = dot_diameter // 2
+    for g in range(4, 0, -1):
+        draw.ellipse(
+            [dot_cx - dot_r - g, dot_cy - dot_r - g,
+             dot_cx + dot_r + g, dot_cy + dot_r + g],
+            outline=_alpha_blend(accent, 0.25 * (1 - g / 4), config.bg_card),
+            width=1
+        )
+    draw.ellipse(
+        [dot_cx - dot_r, dot_cy - dot_r, dot_cx + dot_r, dot_cy + dot_r],
+        fill=accent
+    )
+    status_text_x = dot_cx + dot_r + spacing
+    status_text_y = pill_y + (pill_h - (status_bbox[3] - status_bbox[1])) // 2
+    draw.text((status_text_x, status_text_y), status_lbl, font=f_status, fill=accent)
 
-    # Stat rows
-    stats = [("DATE", date), ("TYPE", "Credit" if is_credit else "Debit"),
-             ("AMOUNT", f"৳{abs_str}")]
-    panel_h   = H - 2 * pad_y
-    row_start = pad_y + int(panel_h * 0.45)
-    row_h_    = int(panel_h * 0.16)
-    f_sl = _font(bold=True, size=fs(0.022))
-    f_sv = _font(bold=True, size=fs(0.032))
-    chart_pad = int(rpanel_w * 0.12)
-    for i, (lbl, val) in enumerate(stats):
-        ry = row_start + i * row_h_
-        if i > 0:
-            draw.line([(rpanel_x + chart_pad, ry - int(row_h_ * 0.3)),
-                       (rpanel_x + rpanel_w - chart_pad, ry - int(row_h_ * 0.3))],
-                      fill=_blend(SLATE600, 0.3, SLATE700), width=1)
-        draw.text((rpanel_x + chart_pad, ry), lbl, font=f_sl, fill=SLATE400)
-        vcol = accent if lbl == "AMOUNT" else SLATE50
-        draw.text((rpanel_x + chart_pad, ry + int(row_h_ * 0.38)), val,
-                  font=f_sv, fill=_blend(vcol, 0.9, SLATE700))
+    # 12. Date
+    f_date = _font(size=fs(config.font_date))
+    date_bbox = draw.textbbox((0, 0), date, font=f_date)
+    date_w = date_bbox[2] - date_bbox[0]
+    date_h = date_bbox[3] - date_bbox[1]
+    date_x = W - pad_x - date_w
+    date_y = pill_y + (pill_h - date_h) // 2
+    draw.text((date_x, date_y), date, font=f_date, fill=config.text_muted)
 
-    buf = _io.BytesIO()
+    # 13. Right Stats Panel
+    panel_y = pad_y
+    panel_h = H - 2 * pad_y
+    draw.rounded_rectangle(
+        [right_panel_x, panel_y, right_panel_x + right_panel_w, panel_y + panel_h],
+        radius=24,
+        fill=config.surface_light
+    )
+    draw.rounded_rectangle(
+        [right_panel_x, panel_y, right_panel_x + right_panel_w, panel_y + panel_h],
+        radius=24,
+        outline=_alpha_blend(accent, 0.08, config.bg_card),
+        width=1
+    )
+    header_y = panel_y + int(panel_h * 0.06)
+    f_header = _font(bold=True, size=fs(0.028))
+    draw.text((right_panel_x + int(right_panel_w * 0.1), header_y), "SUMMARY",
+              font=f_header, fill=_alpha_blend(config.text_primary, 0.7, config.surface_light))
+
+    bars = [0.35, 0.55, 0.45, 0.75, 0.60, 0.85, 0.70, 0.95]
+    chart_pad = int(right_panel_w * 0.12)
+    chart_w = right_panel_w - 2 * chart_pad
+    bar_gap = 4
+    bar_w = (chart_w - (len(bars) - 1) * bar_gap) / len(bars)
+    chart_top = header_y + int(panel_h * 0.07)
+    chart_bottom = panel_y + int(panel_h * 0.34)
+    chart_h = chart_bottom - chart_top
+    for i, bv in enumerate(bars):
+        bx = right_panel_x + chart_pad + i * (bar_w + bar_gap)
+        bh = bv * chart_h * 0.85
+        by = chart_bottom - bh
+        if i == len(bars) - 1:
+            color = accent
+            for g in range(3, 0, -1):
+                draw.rounded_rectangle(
+                    [bx - g, by - g, bx + bar_w + g, by + bh + g],
+                    radius=3,
+                    outline=_alpha_blend(accent, 0.2 * (1 - g / 3), config.surface_light),
+                    width=1
+                )
+        else:
+            color = _alpha_blend(accent, 0.30, config.surface_light)
+        draw.rounded_rectangle([bx, by, bx + bar_w, by + bh], radius=3, fill=color)
+
+    stat_start_y = chart_bottom + int(panel_h * 0.09)
+    row_h = int(panel_h * 0.11)
+    f_stat_label = _font(bold=True, size=fs(config.font_stat_label))
+    f_stat_value = _font(bold=True, size=fs(config.font_stat_value))
+    stat_data = [
+        ("DATE",   date),
+        ("TYPE",   "Credit" if is_credit else "Debit"),
+        ("AMOUNT", f"৳{abs_str}"),
+    ]
+    for idx, (label, value) in enumerate(stat_data):
+        row_y = stat_start_y + idx * row_h
+        if idx > 0:
+            sep_y = row_y - int(row_h * 0.3)
+            draw.line(
+                [(right_panel_x + chart_pad, sep_y),
+                 (right_panel_x + right_panel_w - chart_pad, sep_y)],
+                fill=_alpha_blend(config.divider_color, 0.3, config.surface_light),
+                width=1
+            )
+        draw.text((right_panel_x + chart_pad, row_y), label,
+                  font=f_stat_label,
+                  fill=_alpha_blend(config.text_muted, 0.8, config.surface_light))
+        val_y = row_y + int(row_h * 0.38)
+        value_color = accent if label == "AMOUNT" else config.text_primary
+        draw.text((right_panel_x + chart_pad, val_y), value,
+                  font=f_stat_value,
+                  fill=_alpha_blend(value_color, 0.9, config.surface_light))
+
+    # 14. Save to bytes
+    buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. TELEGRAM SERVICE  (async, inline)
+# 6. TELEGRAM SERVICE
 # ─────────────────────────────────────────────────────────────────────────────
 
 import aiohttp
@@ -495,10 +617,10 @@ def _build_caption(user_id: str, display_name: str, pending: float, date: str) -
     amt  = f"{abs(pending):,.2f}"
     return (
         "🧾 <b>Payment Receipt</b>\n\n"
-        f"👤 <b>Name:</b> {name}\n"
+        
         f"🆔 <b>User ID:</b> <code>{uid}</code>\n"
-        f"📅 <b>Date:</b> {dt}\n"
-        f"💰 <b>{sign}:</b> ৳{amt}\n\n"
+        f"📅 <b>Date:</b> {dt}\n\n"
+
         "📨 Please <b>forward this message</b> to admin for verification.\n"
         "👨‍💼 <b>Admin:</b> @turja_un"
     )
@@ -579,8 +701,8 @@ class TelegramService:
 
     async def _post(self, user_id, caption, photo_bytes):
         data = aiohttp.FormData()
-        data.add_field("chat_id", user_id)
-        data.add_field("caption", caption)
+        data.add_field("chat_id",    user_id)
+        data.add_field("caption",    caption)
         data.add_field("parse_mode", "HTML")
         data.add_field("photo", photo_bytes,
                        filename="payment.png", content_type="image/png")
@@ -588,7 +710,6 @@ class TelegramService:
             return resp.status, await resp.text()
 
     async def send_many(self, users: Sequence[tuple]) -> BatchReport:
-        """users: list of (user_id, display_name, photo_bytes, pending, date)"""
         t0      = time.monotonic()
         tasks   = [self.send_photo(uid, name, pb, pend, dt)
                    for uid, name, pb, pend, dt in users]
@@ -603,15 +724,13 @@ class TelegramService:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. MAIN ORCHESTRATION
+# 7. MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def main():
-    # ── Load config ───────────────────────────────────────────────────────────
     log.info("Loading config...")
     cfg_data = load_config("Config/Config.json")
 
-    # ── Build user summaries ──────────────────────────────────────────────────
     log.info("Building user summaries from CSVs...")
     users = build_user_summaries(cfg_data, csv_dir="CSV")
 
@@ -623,8 +742,7 @@ async def main():
     log.info("Processing %d users | date=%s", len(users), date)
     print()
 
-    # ── Generate cards ────────────────────────────────────────────────────────
-    card_cache: dict[str, tuple] = {}   # user_id → (display_name, bytes, pending)
+    card_cache: dict[str, tuple] = {}
     for u in users:
         uid  = u["user_id"]
         name = u["display_name"]
@@ -640,7 +758,6 @@ async def main():
     print()
     log.info("Cards generated: %d / %d", len(card_cache), len(users))
 
-    # ── Send all via Telegram ─────────────────────────────────────────────────
     if not card_cache:
         log.warning("No cards to send.")
         return
@@ -656,7 +773,6 @@ async def main():
     async with TelegramService() as svc:
         report = await svc.send_many(payload)
 
-    # ── Print report ──────────────────────────────────────────────────────────
     print()
     print("=" * 55)
     print(f"  SEND REPORT  —  {date}")
