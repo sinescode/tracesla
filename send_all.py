@@ -107,17 +107,62 @@ def calculate_total(ok_count: int, tiers: list[dict]) -> tuple[float, float]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. CSV LOADING
+# 3. CSV LOADING  —  also extracts the latest date from filenames
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_csv_entries(csv_dir: str = "CSV") -> list[dict]:
+# Date formats tried against the CSV filename stem (without extension).
+# Add more formats here if your filenames differ.
+_DATE_FORMATS = [
+    "%Y-%m-%d",   # 2024-07-15
+    "%Y_%m_%d",   # 2024_07_15
+    "%d-%m-%Y",   # 15-07-2024
+    "%d_%m_%Y",   # 15_07_2024
+    "%Y-%m",      # 2024-07
+    "%Y_%m",      # 2024_07
+    "%B_%Y",      # July_2024
+    "%b_%Y",      # Jul_2024
+    "%B-%Y",      # July-2024
+    "%b-%Y",      # Jul-2024
+]
+
+
+def _date_from_stem(stem: str) -> str:
+    """Try to parse a date from a CSV filename stem.
+    Returns 'YYYY-MM-DD' string, or '' if nothing matched."""
+    for fmt in _DATE_FORMATS:
+        try:
+            parsed = datetime.strptime(stem, fmt)
+            return parsed.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return ""
+
+
+def load_csv_entries(csv_dir: str = "CSV") -> tuple[list[dict], str]:
+    """Load all CSV rows and return (entries, latest_date).
+
+    latest_date is the most recent date found in any CSV filename,
+    formatted as 'YYYY-MM-DD'.  Falls back to '' if none could be parsed.
+    """
     entries: list[dict] = []
+    latest_date: str = ""
+
     pattern = os.path.join(csv_dir, "*.csv")
     files = sorted(glob.glob(pattern))
     if not files:
         log.warning("No CSV files found in '%s'", csv_dir)
+
     for fpath in files:
         filename = os.path.basename(fpath)
+        stem     = os.path.splitext(filename)[0]
+
+        # ── Detect date from filename ──────────────────────────────────────
+        candidate = _date_from_stem(stem)
+        if candidate and candidate > latest_date:
+            latest_date = candidate
+            log.debug("Latest date updated to %s (from %s)", latest_date, filename)
+        # ──────────────────────────────────────────────────────────────────
+
         try:
             with open(fpath, encoding="utf-8-sig", errors="replace") as f:
                 reader = csv.DictReader(f)
@@ -146,20 +191,28 @@ def load_csv_entries(csv_dir: str = "CSV") -> list[dict]:
             log.info("Loaded %s", filename)
         except Exception as exc:
             log.error("Failed to read %s: %s", filename, exc)
-    return entries
+
+    if latest_date:
+        log.info("Latest CSV date detected: %s", latest_date)
+    else:
+        log.warning("Could not detect a date from any CSV filename.")
+
+    return entries, latest_date
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. BUILD USER SUMMARIES
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_user_summaries(cfg_data: dict, csv_dir: str = "CSV") -> list[dict]:
+def build_user_summaries(cfg_data: dict, csv_dir: str = "CSV") -> tuple[list[dict], str]:
+    """Returns (summaries, latest_date_from_csvs)."""
     tier_defs     = get_tier_definitions(cfg_data)
     tier_index    = build_tier_index(tier_defs)
     user_tier_map = get_user_tiers(cfg_data)
     custom_names  = get_custom_names(cfg_data)
     balances      = get_balances(cfg_data)
-    entries       = load_csv_entries(csv_dir)
+
+    entries, latest_date = load_csv_entries(csv_dir)   # ← unpacks latest_date
 
     user_totals: dict[str, float] = {}
     for entry in entries:
@@ -195,7 +248,7 @@ def build_user_summaries(cfg_data: dict, csv_dir: str = "CSV") -> list[dict]:
         })
 
     summaries.sort(key=lambda x: x["pending"], reverse=True)
-    return summaries
+    return summaries, latest_date   # ← also returns latest_date
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -237,6 +290,10 @@ def _is_blocked(text: str) -> bool:
 
 
 def _build_caption(user_id: str, display_name: str, pending: float, date: str) -> str:
+    """Build the Telegram HTML caption for a payment card.
+
+    date  —  the latest CSV date, shown as "Report till: <date>"
+    """
     import html as _html
     uid  = _html.escape(user_id)
     name = _html.escape(display_name)
@@ -247,8 +304,9 @@ def _build_caption(user_id: str, display_name: str, pending: float, date: str) -
         "🧾 <b>Payment Receipt</b>\n\n"
 
         f"🆔 <b>User ID:</b> <code>{uid}</code>\n"
-        f"📅 <b>Date:</b> {dt}\n\n"
-        
+        f"📅 <b>Report till:</b> {dt}\n"        # ← "Date" → "Report till: <latest CSV date>"
+        f"💰 <b>{sign}:</b> ৳{amt}\n\n"          # ← amount line added
+
         "📨 Please <b>forward this message</b> to admin for verification.\n"
         "👨‍💼 <b>Admin:</b> @turja_un"
     )
@@ -360,14 +418,16 @@ async def main():
     cfg_data = load_config("Config/Config.json")
 
     log.info("Building user summaries from CSVs...")
-    users = build_user_summaries(cfg_data, csv_dir="CSV")
+    users, csv_latest_date = build_user_summaries(cfg_data, csv_dir="CSV")  # ← unpacks
 
     if not users:
         log.warning("No users found — nothing to send.")
         return
 
-    date = datetime.today().strftime("%Y-%m-%d")
-    log.info("Processing %d users | date=%s", len(users), date)
+    # Use the latest CSV date as the report date.
+    # Falls back to today if no date could be parsed from filenames.
+    date = csv_latest_date or datetime.today().strftime("%Y-%m-%d")
+    log.info("Report till: %s  |  users: %d", date, len(users))
     print()
 
     card_cache: dict[str, tuple] = {}
@@ -403,7 +463,7 @@ async def main():
 
     print()
     print("=" * 55)
-    print(f"  SEND REPORT  —  {date}")
+    print(f"  SEND REPORT  —  Report till {date}")
     print("=" * 55)
     print(f"  Total    : {report.total}")
     print(f"  Succeeded: {report.succeeded}")
