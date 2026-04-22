@@ -304,7 +304,7 @@ def _build_caption(user_id: str, display_name: str, pending: float, date: str) -
         "🧾 <b>Payment Receipt</b>\n\n"
 
         f"🆔 <b>User ID:</b> <code>{uid}</code>\n"
-        f"📅 <b>Report till:</b> <b>{dt}<\b>\n\n"
+        f"📅 <b>Report till:</b> <b>{dt}</b> \n\n"
 
         "📨 Please <b>forward this message</b> to admin for verification.\n"
         "👨‍💼 <b>Admin:</b> @turja_un"
